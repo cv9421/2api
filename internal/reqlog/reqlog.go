@@ -84,6 +84,9 @@ type Event struct {
 	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
 	ClientIP         string    `json:"client_ip,omitempty"`
 	UserAgent        string    `json:"user_agent,omitempty"`
+	// ClientID 边缘层（nginx map）判定的「哪把客户端 key」，经 X-Client-Id 传入。
+	// 网关自己分不出来——它只看得到被换过的内部 key。
+	ClientID string `json:"client_id,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），

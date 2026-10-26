@@ -636,6 +636,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#logs" data-view="logs">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>
         运行日志</a></li>
+      <li><a href="#monitor" data-view="monitor">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.8 8h2.4l1.6-4.2 2.4 8.4 1.6-4.2h2.4"/><path d="M14.2 8h-.2"/></svg>
+        安全监控</a></li>
     </ul>
     <div class="sig">
       <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
@@ -1132,6 +1135,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
+            <div class="switch"><span class="lb">隐藏账页「使用明细」标题</span>
+              <input type="checkbox" name="hide_ledger_title"></div>
+            <div class="hint" style="margin-top:4px">CodeBuddy 账单页每行标题取的是<strong>请求体最后一条消息</strong>的前 40 字，等于把提问誊到账页上。开启后网关在出站请求末尾追加一条占位消息（「。」），标题恒为该占位；代价是每条请求多 1~2 token。改动即时生效，无需重启。</div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
@@ -1189,7 +1195,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="tbl-wrap req-wrap">
           <table class="acc req">
             <thead><tr>
-              <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
+              <th>时间</th><th>结果</th><th>模型</th><th>账号</th><th>Key</th>
               <th>来源 IP</th><th>User-Agent</th>
               <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
             </tr></thead>
@@ -1235,6 +1241,105 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th>时间</th><th>账号</th><th class="num">变动</th><th class="num">变动后余额</th><th>说明</th>
             </tr></thead>
             <tbody id="creditBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 安全监控 -->
+    <section class="view" id="view-monitor" hidden>
+      <div class="box">
+        <header>
+          <h3>安全监控 <span class="hint">近 24 小时真实流量画像：谁在用、从哪来、有没有人在试钥匙</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="secNote">—</span>
+          <button class="xs" id="btnSecReload">刷新</button>
+        </header>
+        <div id="secCards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;padding:14px 16px"></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>客户端 Key <span class="hint">A / B 各自一把；轮换立即生效，nginx -t 失败会自动回滚</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="ckNote">—</span>
+          <button class="xs" id="btnCkReload">刷新</button>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr><th>身份</th><th>状态</th><th>Key</th><th style="width:280px">操作</th></tr></thead>
+            <tbody id="ckBody"></tbody>
+          </table>
+        </div>
+        <div style="padding:12px 16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="ckNewId" placeholder="新身份名（如 C）" style="width:180px" aria-label="新身份名">
+          <button class="xs" id="btnCkAdd">添加一把</button>
+          <span class="note">删除 = 立刻失效；轮换 = 生成新值，旧值立即 401</span>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>异常清单</h3>
+          <span class="grow"></span>
+          <span class="note">新来源 / 鉴权失败 / token 超预算</span>
+        </header>
+        <div id="secAlerts"></div>
+      </div>
+
+<div class="box">
+        <header>
+          <h3>24 小时请求分布 <span class="hint">柱高=每小时请求数，红色=该小时有 401</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="secChartNote">—</span>
+        </header>
+        <div id="secChart" style="display:flex;align-items:flex-end;gap:3px;height:140px;padding:12px 16px 0"></div>
+        <div id="secChartAxis" style="display:flex;gap:3px;padding:0 16px 12px;font-size:11px;color:var(--ink-3)"></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>按客户端 key <span class="hint">A / B 各自用了多少，谁带了新来源进来</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="secKeyNote">—</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th>Key</th><th class="num">请求</th><th class="num">来源 IP</th><th>首次</th><th>最后</th>
+            </tr></thead>
+            <tbody id="secKeys"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>来源排行 <span class="hint">按请求数，最多 30 个</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="secSrcNote">—</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th>来源 IP</th><th>User-Agent</th><th>Key</th><th class="num">请求</th>
+              <th>首次出现</th><th>最后出现</th><th>状态</th>
+            </tr></thead>
+            <tbody id="secSources"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>鉴权失败（401）</h3>
+          <span class="grow"></span>
+          <span class="note" id="secFailNote">—</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr><th>时间</th><th>来源 IP</th><th>Key</th><th>User-Agent</th></tr></thead>
+            <tbody id="secFails"></tbody>
           </table>
         </div>
       </div>

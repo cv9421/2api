@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/clientkeys"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -78,6 +79,12 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// ClientKeys 面板维护的「客户端 key」热加载视图（05-apikeys.conf）。
+	// 非 nil 时，除 api_key 之外，清单里启用中的 key 也能通过 /v1/* 与 /status
+	// 鉴权；面板增删/轮换后立即生效（Store 按 mtime 重读 + 面板保存后强制 Reload）。
+	// 鉴权只认这一处，不再需要 nginx 侧的第二份白名单。
+	ClientKeys *clientkeys.Store
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -200,12 +207,67 @@ func isSearchPath(path string) bool {
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		clientID, ok := h.authorize(r)
+		if !ok {
+			// 鉴权失败必须留痕：密钥泄露/被扫的第一信号就是 401 洪水，而这条路径
+			// 在补日志前一个字都不落盘（实测：错 key 请求前后 stdout 行数不变）。
+			// 只记来源与密钥前缀——够判断是"哪把旧 key"还是"瞎猜"，绝不记完整密钥。
+			log.Printf("AUTH-FAIL src=%s ua=%q path=%s keyprefix=%s",
+				clientIPForLog(r), r.UserAgent(), r.URL.Path, bearerPrefix(r))
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
+		if clientID != "" {
+			// 面板 key 命中：把身份补齐给日志。nginx 只在它能匹配 05-apikeys 时
+			// 才给 X-Client-Id，直连或旧 key 翻译场景下由网关自己填。
+			r.Header.Set("X-Client-Id", clientID)
+			if tr := requestTraceFrom(r); tr != nil && tr.clientID == "" {
+				tr.clientID = logfmt.Truncate(clientID, 32)
+			}
+		}
 		next(w, r)
 	}
+}
+
+// authorize 按「网关 api_key → 面板客户端 key 清单」的顺序校验 Bearer。
+// 返回命中 key 的身份标签（api_key 鉴权时为空串）。
+//
+// 两条路径都必须存在：api_key 是面板自身与运维直连的凭据；客户端 key 清单是
+// 面板「客户端 Key」页维护的业务凭据。把它们合并到同一次校验里，才不会出现
+// 「面板改完 key，网关不认」的双源事故。
+func (h *Handler) authorize(r *http.Request) (string, bool) {
+	if httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		return "", true
+	}
+	if h.cfg.ClientKeys == nil {
+		return "", false
+	}
+	tok := clientkeys.ExtractBearer(r.Header.Get("Authorization"))
+	if tok == "" {
+		return "", false
+	}
+	if k, ok := h.cfg.ClientKeys.Lookup(tok); ok {
+		return k.ID, true
+	}
+	return "", false
+}
+
+// bearerPrefix 返回请求携带密钥的前 8 位（用于审计区分旧 key / 乱猜），
+// 不足 8 位整串返回并加省略号；无 Authorization 头返回 "-"。
+func bearerPrefix(r *http.Request) string {
+	v := strings.TrimSpace(r.Header.Get("Authorization"))
+	if v == "" {
+		return "-"
+	}
+	v = strings.TrimSpace(strings.TrimPrefix(v, "Bearer "))
+	v = strings.TrimSpace(strings.TrimPrefix(v, "bearer "))
+	if v == "" {
+		return "-"
+	}
+	if len(v) > 8 {
+		return v[:8] + "…"
+	}
+	return v + "…"
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {

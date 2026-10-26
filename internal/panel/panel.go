@@ -65,6 +65,31 @@ type Config struct {
 	// 留痕由余额查询路径（upstream.Client 的余额观察者）写入。
 	CreditHistory *credithist.Ledger
 
+	// ClientKeyFile nginx 的客户端 key 映射文件（05-apikeys.conf）；空 = 该接口 501。
+	// 面板可轮换/删除；网关（wb2api）直接读同一份文件做鉴权，所以保存后必须
+	// 立刻让网关重读并自检（见 ReloadClientKeys / GatewayAddr）。
+	ClientKeyFile string
+
+	// ReloadClientKeys 让网关立即重读客户端 key 文件（main 注入 clientkeys.Store.Reload）。
+	// nil = 不重读（仅测试/裸用场景）。
+	ReloadClientKeys func()
+
+	// GatewayAddr 网关自身监听地址（如 127.0.0.1:7863），供保存后自检 key 可用性；
+	// 空 = 跳过自检。
+	GatewayAddr string
+
+	// EdgeLogFile 边缘层 nginx 的 /v1/ 访问日志（v1.log）。引入 one-api 之后
+	// wb2api 只看到 127.0.0.1，真实来源与 key 归属只有这里记得住。
+	EdgeLogFile string
+
+	// RequestLogDir 逐请求归档目录（data/request-logs，requests-YYYY-MM-DD.jsonl）；
+	// 安全监控页只用它累加 token 总量（与来源无关）。
+	RequestLogDir string
+
+	// MonitorFile API 监控数据文件（api_monitor.py 写入的 JSONL）；空 = 监控页返回空集。
+	// 只读展示，网关不做任何出站决策依赖它。
+	MonitorFile string
+
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
@@ -196,6 +221,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensationClaim))
 	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
+
+	p.mux.HandleFunc("GET /panel/api/apimonitor", p.withAuth(p.apiMonitor))
+	p.mux.HandleFunc("GET /panel/api/security", p.withAuth(p.apiSecurity))
+	p.mux.HandleFunc("GET /panel/api/clientkeys", p.withAuth(p.apiClientKeys))
+	p.mux.HandleFunc("POST /panel/api/clientkeys", p.withAuth(p.apiClientKeys))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -278,8 +308,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
 }
 

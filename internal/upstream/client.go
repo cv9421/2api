@@ -735,6 +735,12 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
+	// HideLedgerTitle 账单标题遮罩开关（config upstream.hide_ledger_title，默认 false）。
+	// 开时出站请求体末尾追加一条固定占位 user 消息，遮住上游账单「使用明细」标题
+	// （上游取请求体最后一条消息前 ~40 字，见 AppendLedgerTitleMask）。
+	// 面板保存配置热改 + chat 热路径并发读，用 atomic.Bool 消除数据竞争。
+	HideLedgerTitle atomic.Bool
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
@@ -910,6 +916,11 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
+	// 账单标题遮罩（upstream.hide_ledger_title）：末尾追加固定占位 user 消息。
+	// 放在所有改写之后——它是最后一条消息，任何前序步骤都不该再动它。
+	if c.HideLedgerTitle.Load() {
+		body = AppendLedgerTitleMask(body)
+	}
 	return body
 }
 

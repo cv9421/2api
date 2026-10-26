@@ -383,6 +383,8 @@ type requestTrace struct {
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
+	// clientID 边缘层（nginx map）透传的客户端身份（A/B…），直连时为空。
+	clientID string
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
@@ -393,6 +395,8 @@ func (t *requestTrace) captureClientInfo(r *http.Request) {
 	}
 	t.clientIP = clientIPForLog(r)
 	t.userAgent = logfmt.Truncate(r.UserAgent(), maxUserAgentLen)
+	// X-Client-Id 由 nginx 的 map 生成；nginx 无条件覆盖该头，客户端伪造无效。
+	t.clientID = logfmt.Truncate(strings.TrimSpace(r.Header.Get("X-Client-Id")), 32)
 }
 
 // clientIPForLog 提取用于日志展示的客户端 IP。
@@ -479,6 +483,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.CacheMissTokens = s.cacheMiss
 	}
 	e.ClientIP = t.clientIP
+	e.ClientID = t.clientID
 	e.UserAgent = t.userAgent
 	if e.Outcome == "" {
 		if status >= 200 && status < 300 {

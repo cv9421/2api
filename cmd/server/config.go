@@ -18,10 +18,14 @@ import (
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
-	AuthDir   string `json:"auth_dir"`   // ./auths
-	StateFile string `json:"state_file"` // ./data/state.json
+	Listen string `json:"listen"`  // ":7863"
+	APIKey string `json:"api_key"` // 空 = 不鉴权
+
+	// ClientKeyFile 面板维护的客户端 key 清单（nginx 05-apikeys.conf 同款格式）。
+	// 空 = 只认 api_key；缺省落在 data/apikeys.conf，随 state_file 搬移，跨平台可用。
+	ClientKeyFile string `json:"client_key_file"`
+	AuthDir       string `json:"auth_dir"`   // ./auths
+	StateFile     string `json:"state_file"` // ./data/state.json
 	// DNSServers 出站解析用的 DNS 服务器（空 = 系统解析器）；也可用 WB2A_DNS 覆盖。
 	// Android/magisk 模块里没有 /etc/resolv.conf，必须显式指定，否则解析全落本机 :53。
 	DNSServers []string `json:"dns_servers,omitempty"`
@@ -167,6 +171,15 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// HideLedgerTitle 账单标题遮罩（默认 false）：出站请求体末尾追加一条固定的
+		// 占位 user 消息，遮住上游账单页「使用明细」每行标题。
+		//
+		// 为什么需要它：上游取**请求体最后一条消息**的前 ~40 字当标题（实测：末条为
+		// user 时显示用户原话，为 tool 时显示工具输出）。标题纯属展示层，与计费无关，
+		// 但会把提示词逐字誊到官网账页上，分享截图/多号共用时会漏。
+		// 代价：每条请求多一条 1~2 token 的 user 消息（末尾追加，不影响前缀缓存）。
+		// 热生效（面板保存即改），无需重启。
+		HideLedgerTitle bool `json:"hide_ledger_title"`
 	} `json:"upstream"`
 
 	Features struct {

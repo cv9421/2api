@@ -457,6 +457,63 @@ func normalizeToolPatterns(obj map[string]any) {
 	}
 }
 
+// LedgerTitleMaskText 账单标题遮罩占位文本（单个句号）。
+//
+// 选单个句号而不是空串：实测上游接受空 content（200），但空串有两个隐患——某些
+// OpenAI 兼容后端对空 user 消息直接 400；以及标题取不到内容时可能回退到前一条
+// 消息（遮罩失效）。
+//
+// 也不用省略号（"……"）：中文语境里省略号读作"话没说完 / 等你继续"，模型有概率
+// 把它当成未完成的指令去追问或停住；句号是陈述终止符，语义最弱、最不可能被当成
+// 新任务。deepseek-v4.1-flash / glm-5.3-flash / space-bunny 三个模型实测末尾带
+// 句号时照常回答前一条问题。
+const LedgerTitleMaskText = "。"
+
+// AppendLedgerTitleMask 在请求体末尾追加一条占位 user 消息，遮住上游账单页
+// 「使用明细」的每行标题。
+//
+// 背景（实测，2026-10-20）：codebuddy 账单页每行标题 = **请求体最后一条消息**的
+// 前 ~40 字。埋 4 个标记（system / 首条 user / assistant / 末条 user）打真流量，
+// 账页显示的是末条 user 标记。于是 agent 循环里标题会跟着工具输出走，一轮用户
+// 提问的首个请求则把用户原话原样誊上去。
+//
+// 安全性：追加在末尾，前缀缓存不受影响（缓存键只看前缀）；实测 deepseek 系 +
+// glm-5.3-flash + space-bunny 在「tool 结果后追加 user」的形态下仍正常返回
+// tool_calls，问答内容不变。代价是每条请求多 1~2 token。
+//
+// 形态保护：body 非 JSON 对象、messages 缺失或非数组、或末条已是同样占位时原样返回。
+func AppendLedgerTitleMask(src []byte) []byte {
+	if len(src) == 0 {
+		return src
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(src, &obj); err != nil {
+		return src
+	}
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return src
+	}
+	if n := len(msgs); n > 0 {
+		if last, ok := msgs[n-1].(map[string]any); ok {
+			if role, _ := last["role"].(string); role == "user" {
+				if content, _ := last["content"].(string); content == LedgerTitleMaskText {
+					return src // 已是遮罩形态，幂等
+				}
+			}
+		}
+	}
+	obj["messages"] = append(msgs, map[string]any{
+		"role":    "user",
+		"content": LedgerTitleMaskText,
+	})
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return src
+	}
+	return out
+}
+
 // unescapePatternLiteralEscapes 递归改写 schema 树里 pattern 值与 patternProperties
 // 键中的 `\_` → `_`（patternProperties 的键也是正则；map 键不可原地改，命中时重建
 // 该层）。

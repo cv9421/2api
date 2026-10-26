@@ -45,3 +45,7 @@ docs/
 *.zip
 server.exe
 .DS_Store
+wb2api-new
+wb2api-linux-amd64
+wb2api-linux-amd64.exe
+*.bak-*

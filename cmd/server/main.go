@@ -14,10 +14,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/clientkeys"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
@@ -32,7 +34,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.0-panel"
+const appVersion = "1.13.0-panel+modelswitch+hidettitle+dirtycfg+secmon"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -152,6 +154,11 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
+	// 账单标题遮罩（upstream.hide_ledger_title）：出站末尾追加占位消息遮住账页标题。
+	up.HideLedgerTitle.Store(cfg.Upstream.HideLedgerTitle)
+	if cfg.Upstream.HideLedgerTitle {
+		log.Printf("账单标题遮罩已开启：出站请求末尾追加占位 user 消息（%q），账页「使用明细」标题不再显示提示词", upstream.LedgerTitleMaskText)
+	}
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -293,6 +300,14 @@ func main() {
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
+	// 客户端 key 清单：面板写、网关读同一份文件。放在这里集中声明，避免又出现
+	// 「面板写 A 文件、鉴权读 B 变量」的双源漂移（上次就是这么全站 401 的）。
+	clientKeyFile := strings.TrimSpace(cfg.ClientKeyFile)
+	if clientKeyFile == "" {
+		clientKeyFile = stateSibling(cfg.StateFile, "apikeys.conf")
+	}
+	clientKeyStore := clientkeys.NewStore(clientKeyFile)
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -307,8 +322,19 @@ func main() {
 		Live:        live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
-		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
-		ConfigPath: *cfgPath,
+		ProbeFile: stateSibling(cfg.StateFile, "output_probes.json"),
+		// API 监控数据（api_monitor.py 每 60s 追加一行 JSONL），面板「API 监控」页只读消费。
+		MonitorFile: stateSibling(cfg.StateFile, "api_monitor.jsonl"),
+		// 逐请求归档目录：安全监控页据此累加 token 总量。
+		RequestLogDir: stateSibling(cfg.StateFile, "request-logs"),
+		// 边缘日志：来源 IP / 客户端 key / 401 的唯一可信来源。
+		EdgeLogFile: "/opt/nginx-stack/www/sites/api.kmiku.com/log/v1.log",
+		// 客户端 key 映射（nginx 容器挂载出来的 conf.d）：面板写、网关读、nginx 打标签。
+		ClientKeyFile: clientKeyFile,
+		// 保存后立即让网关重读，再按新 key 自检一次——保存成功即等于能真的调用。
+		ReloadClientKeys: clientKeyStore.Reload,
+		GatewayAddr:      cfg.Listen,
+		ConfigPath:       *cfgPath,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -337,10 +363,12 @@ func main() {
 		SoftCooldown: cfg.SoftRateDur,
 		Panel:        pn,
 		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		// 面板「客户端 Key」维护的清单即网关的业务鉴权源（热加载）。
+		ClientKeys: clientKeyStore,
+		Usage:      rec,
+		RequestLog: requestLog,
+		PromptMode: cfg.Prompt.Mode,
+		PromptText: cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
@@ -527,6 +555,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	up.HideLedgerTitle.Store(newCfg.Upstream.HideLedgerTitle) // 账单标题遮罩热生效
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

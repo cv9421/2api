@@ -350,7 +350,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志', monitor: '安全监控' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -359,6 +359,7 @@ function go(v) {
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
+  if (v === 'monitor') { loadMonitor(); loadClientKeys(); }
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
@@ -993,13 +994,23 @@ function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id, e && e.client_id]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
     }
   }
   return true;
+}
+
+/* reqKeyTag 渲染「这条请求用的是哪把对外 key」。值来自 nginx map 生成的 X-Client-Id；
+   历史归档没有该字段 → 显示「—」。 */
+function reqKeyTag(id) {
+  if (!id) return '<span class="muted">—</span>';
+  const colors = { A: '#2563eb', B: '#7c3aed' };
+  const c = colors[id] || '#6b7280';
+  return '<span style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;' +
+    'font-weight:600;color:#fff;background:' + c + '">' + esc(id) + '</span>';
 }
 
 function reqOutcomeTag(e) {
@@ -1039,6 +1050,7 @@ function renderRequestTable() {
       '<td>' + reqOutcomeTag(e) + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
+      '<td>' + reqKeyTag(e && e.client_id) + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td class="num">' + fmtMs(e && e.duration_ms) + '</td>' +
@@ -1046,7 +1058,7 @@ function renderRequestTable() {
       '<td class="num">' + reqCreditCell(e) + '</td>' +
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="10" class="empty">' +
+  }).join('') || '<tr><td colspan="11" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
   const filtered = list.length !== reqEntries.length;
@@ -1153,6 +1165,7 @@ const CFG_MAP = {
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
+  hide_ledger_title: ['upstream', 'hide_ledger_title'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
 };
@@ -1176,6 +1189,29 @@ function put(obj, path, val) {
   o[path[path.length - 1]] = val;
 }
 
+/* 改动集基线：面板只提交「与回填时不同」的字段。
+ *
+ * 为什么必须这么做：服务端 saveConfig 虽然做了「当前文件 map + 提交 map」的深合并，
+ * 但合并的前提是「没提交的键」——而旧版 collectConfig 会把整个表单 30+ 字段一律下发，
+ * 于是任何一次保存都会把 14 个字段整体写回。代价实测过三次：一个停在旧值的面板标签页
+ * 点保存，就把 prompt.mode 从 passthrough 写回 append（配置页默认项），连带把 api_key
+ * 换掉、user_agent 写成 "admin"，全站 401 十六小时。
+ *
+ * 结论：脏字段才发。未改动的字段一个字节都不出现在 POST body 里，服务端自然保留原值，
+ * 陈旧标签页也就无法再覆盖别人的改动。
+ */
+let cfgBaseline = null;
+function formValueOf(el) {
+  if (!el) return '';
+  if (el.type === 'checkbox') return el.checked ? '1' : '0';
+  return String(el.value == null ? '' : el.value).trim();
+}
+function snapshotForm() {
+  const f = $('cfgForm'), out = {};
+  for (const [name] of Object.entries(CFG_MAP)) out[name] = formValueOf(f.elements[name]);
+  return out;
+}
+
 async function loadConfig() {
   try {
     const d = await api('config');
@@ -1190,6 +1226,7 @@ async function loadConfig() {
       else if (Array.isArray(v)) el.value = v.join(', ');
       else el.value = v == null ? (name.startsWith('strategy_') ? 'weighted_random' : '') : v;
     }
+    cfgBaseline = snapshotForm(); // 回填完成即基线：后续保存只发与它不同的字段
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
@@ -1199,6 +1236,9 @@ function collectConfig() {
   for (const [name, path] of Object.entries(CFG_MAP)) {
     const el = f.elements[name];
     if (!el) continue;
+    // 只发改动过的字段（见 cfgBaseline 注释）：与回填基线一致 = 用户没碰 → 不下发。
+    // 基线为 null（页面从未成功 loadConfig）时退回旧行为，避免首次使用发空 body。
+    if (cfgBaseline && cfgBaseline[name] === formValueOf(el)) continue;
     let v;
     if (el.type === 'checkbox') v = el.checked;
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
@@ -3435,3 +3475,168 @@ if ($('btnExpFold')) {
   };
 }
 applyExpFold();
+
+/* ── 安全监控 ────────────────────────────────────────────────────────
+   数据只读自 data/request-logs/*.jsonl（逐请求归档），不主动探测：
+   探测只能证明"我能通"，证明不了"别人在用我的钥匙"。 */
+function fmtNum(n) { return (Number(n) || 0).toLocaleString('zh-CN'); }
+
+async function loadMonitor() {
+  try {
+    const d = await api('security');
+    renderSecurity(d);
+  } catch (e) {
+    toast('读取安全数据失败：' + e.message, 'err');
+    $('secNote').textContent = '读取失败';
+  }
+}
+
+function renderSecurity(d) {
+  const t = d.totals || {};
+  const cards = [
+    ['24h 请求', fmtNum(t.requests), '次'],
+    ['Token 消耗', fmtNum(t.tokens), ''],
+    ['来源 IP', fmtNum(t.sources), '个'],
+    ['鉴权失败', fmtNum(t.auth_fails), '次'],
+  ];
+  $('secCards').innerHTML = cards.map(c =>
+    '<div style="border:1px solid var(--line);border-radius:10px;padding:12px 14px">' +
+    '<div style="font-size:12px;color:var(--ink-3)">' + c[0] + '</div>' +
+    '<div style="font-size:22px;font-weight:600;margin-top:4px">' + c[1] +
+    '<span style="font-size:12px;font-weight:400;color:var(--ink-3);margin-left:4px">' + c[2] + '</span></div>' +
+    '</div>').join('');
+
+  const keys = d.keys || [];
+  const unlabeled = keys.find(k => k.id === '未标注');
+  const alerts = [];
+  if ((t.auth_fails || 0) > 0) alerts.push(['#c0392b', '鉴权失败 ' + t.auth_fails + ' 次', '有人在试 key，或某个客户端令牌已失效']);
+  if (unlabeled && unlabeled.requests > 0) alerts.push(['#b8860b', '未标注令牌的请求 ' + unlabeled.requests + ' 次', '请求没带可识别的令牌，或令牌不在 nginx 映射表里']);
+  $('secAlerts').innerHTML = alerts.length
+    ? alerts.map(a => '<div style="padding:10px 16px;border-bottom:1px solid var(--line-soft)">' +
+        '<span style="color:' + a[0] + ';font-weight:600">' + a[1] + '</span>' +
+        '<span style="color:var(--ink-3);margin-left:10px;font-size:12px">' + a[2] + '</span></div>').join('')
+    : '<div style="padding:14px 16px;color:var(--ink-3)">24 小时内无异常</div>';
+  $('secNote').textContent = '窗口 ' + d.window_hours + ' 小时' + (d.note ? ' · ' + d.note : '');
+
+  const rows = d.sources || [];
+  $('secSources').innerHTML = rows.length ? rows.map(s =>
+    '<tr><td>' + s.ip + '</td><td style="font-size:12px">' + (s.ua || '-') + '</td>' +
+    '<td>' + reqKeyTag(s.client_id) + '</td>' +
+    '<td class="num">' + fmtNum(s.requests) + '</td>' +
+    '<td>' + s.first_seen + '</td><td>' + s.last_seen + '</td>' +
+    '<td>' + (s.client_id ? '已标注' : '<span style="color:#b8860b">未标注</span>') + '</td></tr>').join('')
+    : '<tr><td colspan="7"><div class="empty">窗口内没有请求</div></td></tr>';
+  $('secSrcNote').textContent = rows.length + ' 个来源';
+
+  $('secKeys').innerHTML = keys.length ? keys.map(k =>
+    '<tr><td><b>' + k.id + '</b></td>' +
+    '<td class="num">' + fmtNum(k.requests) + '</td>' +
+    '<td class="num">' + k.sources + '</td>' +
+    '<td>' + k.first_seen + '</td><td>' + k.last_seen + '</td></tr>').join('')
+    : '<tr><td colspan="5"><div class="empty">窗口内没有请求</div></td></tr>';
+  $('secKeyNote').textContent = keys.length + ' 把令牌';
+
+  const fails = d.auth_fails || [];
+  $('secFails').innerHTML = fails.length ? fails.map(f =>
+    '<tr><td>' + f.time + '</td><td>' + f.ip + '</td>' +
+    '<td>' + reqKeyTag(f.key_prefix) + '</td>' +
+    '<td style="font-size:12px">' + (f.ua || '-') + '</td></tr>').join('')
+    : '<tr><td colspan="4"><div class="empty">无鉴权失败</div></td></tr>';
+  $('secFailNote').textContent = fails.length + ' 条';
+
+  // 24 小时柱状图：柱高按请求数归一化，红色 = 该小时出现过 401
+  const hourly = d.hourly || [];
+  const peak = Math.max(1, ...hourly.map(h => h.req || 0));
+  $('secChart').innerHTML = hourly.map((h, i) => {
+    const req = h.req || 0;
+    const fail = h.fail || 0;
+    const hgt = req ? Math.max(3, Math.round(req / peak * 118)) : 2;
+    const color = fail ? '#c0392b' : (req ? 'var(--accent)' : 'var(--line)');
+    const tip = (h.t || ('第 ' + (i + 1) + ' 小时')) + ' · 请求 ' + req + (fail ? ' · 401 ' + fail : '');
+    return '<div title="' + tip + '" style="flex:1;display:flex;align-items:flex-end;height:100%">' +
+      '<div style="width:100%;height:' + hgt + 'px;background:' + color + ';border-radius:2px 2px 0 0"></div></div>';
+  }).join('');
+  $('secChartAxis').innerHTML = hourly.map((h, i) =>
+    '<div style="flex:1;text-align:center">' + ((i % 6 === 0) ? (h.t ? h.t.slice(0, 2) + ':00' : '') : '') + '</div>').join('');
+  const peakHour = hourly.reduce((a, b) => ((b.req || 0) > (a.req || 0) ? b : a), { req: 0 });
+  $('secChartNote').textContent = '峰值 ' + (peakHour.req || 0) + ' 次/时';
+}
+
+const btnSecReload = $('btnSecReload');
+if (btnSecReload) btnSecReload.onclick = loadMonitor;
+
+/* ── 客户端 Key 管理 ────────────────────────────────────────────────
+   A/B 两把 key 存在 nginx 的 05-apikeys.conf 里。轮换/删除都走同一个接口，
+   后端会先 nginx -t 再 reload，失败自动回滚——面板里点坏了不会把服务点没了。 */
+let ckShown = {};
+async function loadClientKeys() {
+  try {
+    const d = await api('clientkeys');
+    const rows = d.keys || [];
+    $('ckBody').innerHTML = rows.length ? rows.map(k => {
+      const shown = !!ckShown[k.id];
+      const masked = k.key.slice(0, 8) + '…' + k.key.slice(-4);
+      const off = !!k.disabled;
+      return '<tr' + (off ? ' style="opacity:.55"' : '') + '>' +
+        '<td><b>' + k.id + '</b></td>' +
+        '<td>' + (off ? '<span style="color:#c0392b">已禁用</span>' : '<span style="color:#1e874b">启用中</span>') + '</td>' +
+        '<td><code style="font-size:12px">' + (shown ? k.key : masked) + '</code> ' +
+        '<button class="xs" data-ck-eye="' + k.id + '">' + (shown ? '隐藏' : '显示') + '</button>' +
+        '<button class="xs" data-ck-copy="' + k.id + '">复制</button></td>' +
+        '<td><button class="xs" data-ck-tog="' + k.id + '">' + (off ? '启用' : '禁用') + '</button> ' +
+        '<button class="xs" data-ck-rot="' + k.id + '">轮换</button> ' +
+        '<button class="xs" data-ck-del="' + k.id + '">删除</button></td></tr>';
+    }).join('') : '<tr><td colspan="4"><div class="empty">还没有客户端 key</div></td></tr>';
+    $('ckNote').textContent = rows.length + ' 把 · ' + (d.file || '');
+    ckBind(rows);
+  } catch (e) {
+    toast('读取客户端 key 失败：' + e.message, 'err');
+  }
+}
+
+function ckBind(rows) {
+  const find = id => rows.find(r => r.id === id) || {};
+  document.querySelectorAll('[data-ck-eye]').forEach(b => b.onclick = () => {
+    ckShown[b.dataset.ckEye] = !ckShown[b.dataset.ckEye];
+    loadClientKeys();
+  });
+  document.querySelectorAll('[data-ck-copy]').forEach(b => b.onclick = async () => {
+    const k = find(b.dataset.ckCopy).key || '';
+    try { await navigator.clipboard.writeText(k); toast('已复制 ' + b.dataset.ckCopy + ' 的 key', 'ok'); }
+    catch { toast('复制失败，请点「显示」后手动选中', 'err'); }
+  });
+  document.querySelectorAll('[data-ck-tog]').forEach(b => b.onclick = async () => {
+    const k = find(b.dataset.ckTog);
+    const willDisable = !k.disabled;
+    if (!confirm((willDisable ? '禁用 ' : '启用 ') + b.dataset.ckTog + '？' +
+      (willDisable ? '禁用后这把 key 立刻 401，但值会保留，随时可以启用回来。' : ''))) return;
+    await ckPost({ id: b.dataset.ckTog, action: willDisable ? 'disable' : 'enable' });
+  });
+  document.querySelectorAll('[data-ck-rot]').forEach(b => b.onclick = async () => {
+    if (!confirm('轮换 ' + b.dataset.ckRot + ' 的 key？旧 key 会立刻失效，用到它的客户端要同步改。')) return;
+    await ckPost({ id: b.dataset.ckRot, action: 'rotate' });
+  });
+  document.querySelectorAll('[data-ck-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('删除 ' + b.dataset.ckDel + '？这个身份会立刻无法调用。')) return;
+    await ckPost({ id: b.dataset.ckDel, action: 'delete' });
+  });
+  const addBtn = $('btnCkAdd');
+  if (addBtn) addBtn.onclick = async () => {
+    const id = ($('ckNewId').value || '').trim();
+    if (!id) { toast('先填身份名', 'err'); return; }
+    await ckPost({ id, action: 'add' });
+    $('ckNewId').value = '';
+  };
+}
+
+async function ckPost(body) {
+  try {
+    await api('clientkeys', { method: 'POST', body: JSON.stringify(body) });
+    toast('已生效，nginx 已 reload', 'ok');
+    loadClientKeys();
+  } catch (e) {
+    toast('失败：' + e.message, 'err');
+  }
+}
+const btnCkReload = $('btnCkReload');
+if (btnCkReload) btnCkReload.onclick = loadClientKeys;
